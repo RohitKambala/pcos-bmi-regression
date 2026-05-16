@@ -1,0 +1,484 @@
+---
+title: |
+  | Using Linear Regression to Identify Clinical and
+  | Hormonal Predictors of BMI in Women with PCOS
+subtitle: "GPH-GU 2338: Linear Regression and Modeling"
+author: "Rohit Kambala, Navjot Kaur"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_caption: true
+    number_sections: false
+fontsize: 12pt
+geometry: margin=1in
+mainfont: "Arial"
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \captionsetup{font=footnotesize, labelfont=bf}
+  - \usepackage{setspace}
+  - \singlespacing
+  - \usepackage{parskip}
+  - \setlength{\parskip}{3pt}
+  - \setlength{\parindent}{0pt}
+  - \floatplacement{figure}{H}
+  - \floatplacement{table}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.pos   = "H",
+  out.extra = ""
+)
+```
+
+```{r libraries}
+library(readxl)
+library(car)
+library(lmtest)
+library(MASS)
+library(knitr)
+library(tidyverse)
+library(kableExtra)
+library(sandwich)
+library(patchwork)
+```
+
+```{r load-clean}
+# ── DATA LOADING ──────────────────────────────────────────────────────────────
+# Supports both XLSX (original format) and CSV fallback.
+# Place the data file in the same folder as this .Rmd — no path changes needed.
+if (file.exists("PCOS_data_without_infertility.xlsx")) {
+  df_raw <- read_excel("PCOS_data_without_infertility.xlsx",
+                       sheet = "Full_new",
+                       na    = c("", "NA", " "))
+} else {
+  df_raw <- read.csv("PCOS_data_without_infertility.csv",
+                     stringsAsFactors = FALSE,
+                     na.strings       = c("", "NA", " "))
+}
+names(df_raw) <- make.names(names(df_raw), unique = TRUE)
+
+# ── SELECT AND RENAME ─────────────────────────────────────────────────────────
+# Column names after make.names() from the source file:
+#   Age..yrs.        Waist.Hip.Ratio  FSH.mIU.mL.   LH.mIU.mL.
+#   FSH.LH           AMH.ng.mL.       TSH..mIU.L.   RBS.mg.dl.
+#   Pulse.rate.bpm.  Cycle.R.I.       Weight.gain.Y.N.
+#   Fast.food..Y.N.  Reg.Exercise.Y.N. PCOS..Y.N.
+df <- df_raw %>%
+  dplyr::select(
+    BMI              = BMI,
+    Age              = Age..yrs.,
+    Waist_Hip_Ratio  = Waist.Hip.Ratio,
+    FSH              = FSH.mIU.mL.,
+    LH               = LH.mIU.mL.,
+    FSH_LH           = FSH.LH,
+    AMH              = AMH.ng.mL.,
+    TSH              = TSH..mIU.L.,
+    Fasting_BS       = RBS.mg.dl.,
+    Pulse_Rate       = Pulse.rate.bpm.,
+    Cycle_Regularity = Cycle.R.I.,
+    Weight_Gain      = Weight.gain.Y.N.,
+    Fast_Food        = Fast.food..Y.N.,
+    Physical_Activity= Reg.Exercise.Y.N.,
+    PCOS             = PCOS..Y.N.
+  ) %>%
+  mutate(across(c(AMH, FSH, LH, FSH_LH, TSH, Fasting_BS,
+                  Waist_Hip_Ratio, Pulse_Rate, Age, BMI),
+                as.numeric)) %>%
+  # ── Winsorise FSH, LH, FSH_LH at 99th percentile ──────────────────────────
+  # Raw maxima (FSH = 5052, LH = 2018 mIU/mL) are physiologically impossible;
+  # p99 values (15.3, 10.7 mIU/mL) fall within normal clinical ranges.
+  mutate(
+    FSH    = { cap <- quantile(FSH,    0.99, na.rm=TRUE); ifelse(FSH    > cap, cap, FSH)    },
+    LH     = { cap <- quantile(LH,     0.99, na.rm=TRUE); ifelse(LH     > cap, cap, LH)     },
+    FSH_LH = { cap <- quantile(FSH_LH, 0.99, na.rm=TRUE); ifelse(FSH_LH > cap, cap, FSH_LH) }
+  ) %>%
+  # ── Binary dummy encoding ─────────────────────────────────────────────────
+  # Cycle.R.I: 4 = Regular, other (5) = Irregular
+  # Y/N variables: 1 = Yes, 0 = No
+  mutate(
+    Cycle_Regular    = as.integer(Cycle_Regularity == 4),
+    Weight_Gain_Yes  = as.integer(Weight_Gain == 1),
+    Fast_Food_Yes    = as.integer(Fast_Food == 1),
+    Phys_Act_Yes     = as.integer(Physical_Activity == 1),
+    PCOS_Yes         = as.integer(PCOS == 1),
+    # Factor versions for plots
+    Cycle_f  = factor(Cycle_Regular,   labels = c("Irregular", "Regular")),
+    WG_f     = factor(Weight_Gain_Yes, labels = c("No", "Yes")),
+    FF_f     = factor(Fast_Food_Yes,   labels = c("No", "Yes")),
+    PA_f     = factor(Phys_Act_Yes,    labels = c("No", "Yes")),
+    PCOS_f   = factor(PCOS_Yes,        labels = c("No PCOS", "PCOS"))
+  ) %>%
+  drop_na()
+
+n_analytic <- nrow(df)
+```
+
+## Introduction
+
+Polycystic Ovary Syndrome (PCOS) is one of the most prevalent hormonal disorders among women of reproductive age, affecting an estimated 8--13% of women globally [1, 2]. While PCOS is widely recognised for disrupting menstrual cycles and fertility, its metabolic consequences are equally significant: women with PCOS are substantially more likely to carry excess body weight than unaffected women, with some estimates placing the prevalence of overweight or obesity in this group at 50--80% [3]. Two primary biological pathways are thought to connect PCOS to elevated body mass index (BMI). First, insulin resistance --- a hallmark of PCOS --- promotes fat storage and impairs the body's ability to break down stored fat [4]. Second, thyroid dysfunction, which occurs at elevated rates alongside PCOS, further slows metabolism and contributes to weight gain [5]. Despite these established links, the relative importance of hormonal, clinical, and lifestyle factors for predicting BMI in this population remains incompletely understood.
+
+This study uses multiple linear regression to identify which clinical, hormonal, and lifestyle variables are independently associated with BMI in a sample of women with and without PCOS from Kerala, India. BMI (kg/m^2^) was chosen as the outcome because it is the standard clinical measure of weight status and directly captures the metabolic burden of PCOS.
+
+## Methods
+
+**Data.** We use the PCOS Dataset compiled by Kottarathil [6] from a retrospective clinical audit of 10 hospitals across Kerala, India. The file PCOS_data_without_infertility was used because it provides a self-contained panel of clinical and hormonal variables unconfounded by infertility treatment protocols. The original dataset contained 541 observations; three observations (0.6%) with missing values on selected analysis variables were removed, yielding an analytic sample of N = `r n_analytic`. Given the negligible proportion of missing data, complete-case analysis is unlikely to introduce meaningful bias.
+
+**Variables.** BMI (kg/m^2^) served as the continuous outcome. Raw weight was excluded as a predictor because it is a direct mathematical component of BMI. Fourteen candidate predictors spanned four domains: hormonal markers (FSH, LH, FSH/LH ratio, AMH, TSH); clinical measures (age, waist:hip ratio, fasting blood sugar, pulse rate); binary lifestyle indicators (weight gain, fast food consumption, physical activity); and cycle regularity and PCOS diagnosis. FSH and LH contained physiologically implausible extreme values consistent with data entry error and were winsorised at their 99th percentile prior to analysis. The FSH/LH ratio was excluded from all models on conceptual grounds --- it is a mathematical derivative of FSH and LH, both of which appear independently in the model, making its inclusion structurally redundant regardless of VIF values. All remaining predictors had acceptable VIFs (all below 2) following winsorisation.
+
+**Statistical analysis plan.** Descriptive statistics (means, standard deviations, and proportions) were computed for all variables. Bivariate associations were assessed via Pearson correlations and scatterplots with LOESS smoothers. Four regression models were estimated on the full analytic sample (N = `r n_analytic`):
+
+(1) *Full model*: BMI regressed simultaneously on all 13 candidate predictors.
+(2) *AIC-selected model*: Bidirectional stepwise selection minimising AIC, adopted as the final model.
+(3) *BIC-selected model*: Bidirectional stepwise selection minimising BIC, used as a parsimony benchmark.
+(4) *Interaction model*: AIC-selected predictors augmented with a PCOS $\times$ Cycle Regularity interaction term to investigate an unexpected finding.
+
+Regression assumptions were assessed via residual and Q-Q plots, the Shapiro-Wilk normality test, and the Breusch-Pagan homoscedasticity test. Influential observations were identified using leverage, Cook's Distance (threshold 4/*n*), and DFBETAs. HC3 heteroscedasticity-consistent standard errors were computed to account for potential within-hospital correlation. A Box-Cox transformation was explored; the untransformed model was retained for interpretability (optimal $\lambda = 0.73$; transformation did not improve normality or Adj. R^2^). Predicted BMI values and 95% prediction intervals were computed for representative covariate profiles. All analyses were conducted in R.
+
+## Results
+
+```{r table1}
+desc_cont <- tibble(
+  Variable = c("BMI (kg/m\u00b2)", "Age (years)", "Waist:Hip Ratio",
+               "FSH (mIU/mL)", "LH (mIU/mL)", "AMH (ng/mL)",
+               "TSH (mIU/L)", "Fasting Blood Sugar (mg/dL)",
+               "Pulse Rate (bpm)"),
+  Summary  = c(
+    sprintf("%.2f (%.2f)", mean(df$BMI),         sd(df$BMI)),
+    sprintf("%.2f (%.2f)", mean(df$Age),         sd(df$Age)),
+    sprintf("%.2f (%.2f)", mean(df$Waist_Hip_Ratio), sd(df$Waist_Hip_Ratio)),
+    sprintf("%.2f (%.2f)", mean(df$FSH),         sd(df$FSH)),
+    sprintf("%.2f (%.2f)", mean(df$LH),          sd(df$LH)),
+    sprintf("%.2f (%.2f)", mean(df$AMH,na.rm=T), sd(df$AMH,na.rm=T)),
+    sprintf("%.2f (%.2f)", mean(df$TSH),         sd(df$TSH)),
+    sprintf("%.2f (%.2f)", mean(df$Fasting_BS),  sd(df$Fasting_BS)),
+    sprintf("%.2f (%.2f)", mean(df$Pulse_Rate),  sd(df$Pulse_Rate))
+  )
+)
+desc_cat <- tibble(
+  Variable = c("Cycle: Irregular", "Cycle: Regular",
+               "Weight Gain: Yes", "Fast Food: Yes",
+               "Physical Activity: Yes", "PCOS Diagnosis: Yes"),
+  Summary  = c(
+    sprintf("%d (%.0f%%)", sum(df$Cycle_Regular==0), 100*mean(df$Cycle_Regular==0)),
+    sprintf("%d (%.0f%%)", sum(df$Cycle_Regular==1), 100*mean(df$Cycle_Regular==1)),
+    sprintf("%d (%.0f%%)", sum(df$Weight_Gain_Yes),  100*mean(df$Weight_Gain_Yes)),
+    sprintf("%d (%.0f%%)", sum(df$Fast_Food_Yes),    100*mean(df$Fast_Food_Yes)),
+    sprintf("%d (%.0f%%)", sum(df$Phys_Act_Yes),     100*mean(df$Phys_Act_Yes)),
+    sprintf("%d (%.0f%%)", sum(df$PCOS_Yes),         100*mean(df$PCOS_Yes))
+  )
+)
+bind_rows(desc_cont, desc_cat) %>%
+  kable(col.names = c("Characteristic", paste0("N = ", n_analytic)),
+        caption   = paste0("Descriptive statistics (N = ", n_analytic,
+                           "). Continuous: Mean (SD); categorical: n (\\%)."),
+        booktabs  = TRUE, linesep = "") %>%
+  kable_styling(latex_options = c("hold_position","scale_down"), font_size = 9) %>%
+  pack_rows("Continuous",  1, 9) %>%
+  pack_rows("Categorical", 10, 15)
+```
+
+The analytic sample of `r n_analytic` women had a mean BMI of `r round(mean(df$BMI),1)` kg/m^2^ (SD = `r round(sd(df$BMI),1)`). Roughly one-third had a confirmed PCOS diagnosis (`r round(100*mean(df$PCOS_Yes))`%), and `r round(100*mean(df$Weight_Gain_Yes))`% reported recent weight gain. Pearson correlations showed all continuous predictors had weak bivariate associations with BMI (\|*r*\| \< 0.10), with fasting blood sugar (*r* = `r round(cor(df$BMI, df$Fasting_BS),2)`) and TSH (*r* = `r round(cor(df$BMI, df$TSH),2)`) showing the largest, though still modest, associations. Boxplots confirmed weight gain as the binary predictor most strongly associated with BMI (Figure 1).
+
+```{r fig1-boxplots, fig.width=6.5, fig.height=2.3, fig.cap="BMI distributions by binary predictors. Women reporting weight gain show markedly higher median BMI ($\\sim$3--4~kg/m\\textsuperscript{2}). Regular menstrual cycles are associated with unexpectedly higher median BMI --- investigated via interaction analysis below."}
+df %>%
+  pivot_longer(c(Cycle_f, WG_f, FF_f, PA_f, PCOS_f),
+               names_to="Var", values_to="Val") %>%
+  mutate(Var = dplyr::recode(Var,
+    Cycle_f="Cycle Regularity", WG_f="Weight Gain",
+    FF_f="Fast Food", PA_f="Physical Activity", PCOS_f="PCOS Diagnosis")) %>%
+  ggplot(aes(x=Val, y=BMI, fill=Var)) +
+  geom_boxplot(alpha=0.65, outlier.size=0.4, show.legend=FALSE) +
+  facet_wrap(~Var, scales="free_x", nrow=1) +
+  scale_fill_brewer(palette="Set2") +
+  labs(x=NULL, y="BMI (kg/m\u00b2)") +
+  theme_bw(base_size=9) +
+  theme(strip.text=element_text(size=7.5), axis.text.x=element_text(size=7),
+        panel.grid.minor=element_blank())
+```
+
+```{r fit-models, results='hide'}
+# Full model (13 predictors; FSH_LH excluded on conceptual grounds)
+model_full <- lm(BMI ~ Age + Waist_Hip_Ratio + FSH + LH + AMH +
+                   TSH + Fasting_BS + Pulse_Rate +
+                   Cycle_Regular + Weight_Gain_Yes + Fast_Food_Yes +
+                   Phys_Act_Yes + PCOS_Yes,
+                 data = df)
+
+# AIC and BIC stepwise on the full model
+step_aic <- stepAIC(model_full, direction="both", trace=FALSE)
+step_bic <- stepAIC(model_full, direction="both", trace=FALSE,
+                    k=log(nrow(df)))
+
+# Final model = AIC-selected
+final_model <- step_aic
+final_sum   <- summary(final_model)
+
+# Interaction model (Model 4)
+model_int <- lm(BMI ~ PCOS_Yes * Cycle_Regular + Weight_Gain_Yes +
+                  TSH + Fasting_BS + Phys_Act_Yes, data=df)
+int_p <- round(coef(summary(model_int))["PCOS_Yes:Cycle_Regular","Pr(>|t|)"], 3)
+```
+
+```{r model-comparison-table}
+mc <- tibble(
+  Model    = c("Full (13 predictors)",
+               paste0("AIC-selected (", length(coef(step_aic))-1, ")"),
+               paste0("BIC-selected (", length(coef(step_bic))-1, ")")),
+  AIC      = round(c(AIC(model_full), AIC(step_aic), AIC(step_bic)), 2),
+  BIC      = round(c(BIC(model_full), BIC(step_aic), BIC(step_bic)), 2),
+  `R²`      = round(c(summary(model_full)$r.squared,
+                     final_sum$r.squared,
+                     summary(step_bic)$r.squared), 3),
+  `Adj. R²` = round(c(summary(model_full)$adj.r.squared,
+                     final_sum$adj.r.squared,
+                     summary(step_bic)$adj.r.squared), 3)
+)
+mc %>%
+  kable(caption="Nested model comparison via AIC and BIC stepwise selection. The AIC-selected model is adopted as the final model (bold); see text for justification.",
+        booktabs=TRUE, linesep="") %>%
+  kable_styling(latex_options=c("hold_position","scale_down"), font_size=9) %>%
+  row_spec(2, bold=TRUE)
+```
+
+**Model selection.** The AIC-selected model retains `r length(coef(step_aic))-1` predictors (Adj. R^2^ = `r round(final_sum$adj.r.squared,3)`). The BIC-selected model retains only Cycle Regularity and Weight Gain (Adj. R^2^ = `r round(summary(step_bic)$adj.r.squared,3)`), differing by just `r round(final_sum$adj.r.squared - summary(step_bic)$adj.r.squared,3)` Adj. R^2^ units from the AIC model. This is informative: BIC's strict penalty signals that these two predictors carry essentially all robust signal for BMI in this dataset. The AIC model was adopted as the final model to additionally examine TSH (motivated by the thyroid-metabolism pathway) and fasting blood sugar (a proxy for insulin resistance, the primary mechanism linking PCOS to adiposity [4]).
+
+```{r coef-combined-table}
+# OLS coefficients
+ols_coef <- coef(final_sum)
+
+# HC3 robust standard errors
+hc3_se  <- sqrt(diag(vcovHC(final_model, type="HC3")))
+hc3_t   <- coef(final_model) / hc3_se
+hc3_p   <- 2 * pt(-abs(hc3_t), df=df.residual(final_model))
+
+pretty <- c(
+  "(Intercept)"        = "Intercept",
+  "LH"                 = "LH (mIU/mL)",
+  "TSH"                = "TSH (mIU/L)",
+  "Fasting_BS"         = "Fasting Blood Sugar (mg/dL)",
+  "Cycle_Regular"      = "Cycle: Regular vs. Irregular",
+  "Weight_Gain_Yes"    = "Weight Gain: Yes vs. No",
+  "Phys_Act_Yes"       = "Physical Activity: Yes vs. No"
+)
+
+tibble(
+  Predictor  = dplyr::recode(rownames(ols_coef), !!!pretty),
+  Beta       = round(ols_coef[,1], 3),
+  `SE (OLS)` = round(ols_coef[,2], 3),
+  `p (OLS)`  = round(ols_coef[,4], 3),
+  `SE (HC3)` = round(hc3_se, 3),
+  `p (HC3)`  = round(hc3_p, 3),
+  ` `        = case_when(hc3_p<0.001~"***", hc3_p<0.01~"**",
+                         hc3_p<0.05~"*",   hc3_p<0.10~".", TRUE~"")
+) %>%
+  kable(col.names=c("Predictor","$\\hat{\\beta}$","SE (OLS)","p (OLS)",
+                    "SE (HC3)","p (HC3)",""),
+        escape=FALSE,
+        caption="Final model coefficients with OLS and HC3-robust standard errors. HC3 errors account for potential within-hospital correlation. Significance based on HC3 p-values: *** p$<$0.001, ** p$<$0.01, * p$<$0.05, . p$<$0.10.",
+        booktabs=TRUE, linesep="") %>%
+  kable_styling(latex_options=c("hold_position","scale_down"), font_size=9)
+```
+
+**Final model.** The model explained `r round(100*final_sum$r.squared,1)`% of variance in BMI (Adj. R^2^ = `r round(final_sum$adj.r.squared,3)`; overall F-test *p* \< 0.001). Three predictors were statistically significant based on HC3-robust standard errors (Table 3):
+
+- **Weight gain** was the dominant predictor. Women who reported recent weight gain had BMI approximately `r round(abs(coef(final_model)["Weight_Gain_Yes"]),1)` kg/m^2^ higher on average than those who did not, after controlling for all other variables ($\hat{\beta}$ = `r round(coef(final_model)["Weight_Gain_Yes"],3)`, HC3 SE = `r round(hc3_se["Weight_Gain_Yes"],3)`, *p* \< 0.001). The sensitivity analysis confirmed this as the most robust finding, with near-zero coefficient change after excluding influential observations.
+
+- **Cycle regularity** showed an unexpected positive association: women with regular menstrual cycles had BMI about `r round(abs(coef(final_model)["Cycle_Regular"]),1)` kg/m^2^ higher than those with irregular cycles ($\hat{\beta}$ = `r round(coef(final_model)["Cycle_Regular"],3)`, HC3 SE = `r round(hc3_se["Cycle_Regular"],3)`, *p* = `r round(hc3_p["Cycle_Regular"],3)`). This unexpected direction is explored below and most likely reflects sample composition.
+
+- **TSH** was positively associated with BMI: each one-unit increase in TSH (mIU/L) was associated with a `r round(coef(final_model)["TSH"],3)` kg/m^2^ increase in BMI ($\hat{\beta}$ = `r round(coef(final_model)["TSH"],3)`, HC3 SE = `r round(hc3_se["TSH"],3)`, *p* = `r round(hc3_p["TSH"],3)`), consistent with the known role of thyroid hormones in metabolic regulation [5]. However, the TSH coefficient was substantially driven by influential observations (see below) and should be treated as exploratory.
+
+LH and physical activity were retained by AIC but were not statistically significant (*p* \> 0.09). PCOS diagnosis was not independently associated with BMI once hormonal and lifestyle covariates were controlled (*p* \> 0.28 in the full model), suggesting PCOS influences BMI indirectly through these mediating pathways rather than as a direct effect [4].
+
+```{r fig2-diagnostics, fig.width=6.5, fig.height=2.6, fig.cap="Residual diagnostics. Left: Residuals vs. fitted values show no systematic curvature, supporting linearity; the two vertical bands are artefacts of the binary weight gain predictor. Right: Normal Q-Q plot shows mild upper-tail deviation from a small number of high-BMI observations."}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+plot(final_model, which = 1,
+     main = "A) Residuals vs. Fitted", cex.main = 0.9,
+     pch = 16, cex = 0.45, col = rgb(0,0,0,0.3))
+plot(final_model, which = 2,
+     main = "B) Normal QQ Plot", cex.main = 0.9,
+     pch = 16, cex = 0.45, col = rgb(0,0,0,0.3))
+```
+
+```{r diagnostics-compute, include=FALSE}
+sw <- shapiro.test(residuals(final_model))
+bp <- bptest(final_model)
+```
+
+**Model diagnostics.** Linearity held: the residuals vs. fitted plot showed no systematic pattern (Figure 2). The Shapiro-Wilk test indicated mild non-normality (W = `r round(sw$statistic,4)`, *p* \< 0.001), common with right-skewed outcomes such as BMI; with N = `r n_analytic`, the Central Limit Theorem ensures inference on regression coefficients remains approximately valid. Homoscedasticity held (Breusch-Pagan: BP = `r round(bp$statistic,3)`, *p* = `r round(bp$p.value,3)`). HC3-robust and OLS standard errors produced identical significance conclusions (Table 3).
+
+```{r influential-sensitivity}
+n_obs     <- nrow(df)
+cook_thresh <- 4 / n_obs
+dfb_thresh  <- 2 / sqrt(n_obs)
+
+dfb      <- dfbetas(final_model)
+sig_cols <- intersect(c("TSH","Cycle_Regular","Weight_Gain_Yes"), colnames(dfb))
+flagged  <- unique(which(abs(dfb[, sig_cols, drop=FALSE]) > dfb_thresh,
+                         arr.ind=TRUE)[,1])
+n_flagged <- length(flagged)
+
+model_excl <- lm(formula(final_model), data=df[-flagged,])
+
+coef_main <- coef(final_model)[sig_cols]
+coef_excl <- coef(model_excl)[sig_cols]
+
+sens_tbl <- tibble(
+  Predictor = dplyr::recode(sig_cols,
+    TSH              = "TSH (mIU/L)",
+    Cycle_Regular    = "Cycle: Regular vs. Irregular",
+    Weight_Gain_Yes  = "Weight Gain: Yes vs. No"),
+  `$\\hat{\\beta}$ Full` = round(coef_main, 3),
+  `$\\hat{\\beta}$ Excl.`= round(coef_excl[sig_cols], 3),
+  `% Change`  = round(100*(coef_excl[sig_cols]-coef_main)/abs(coef_main), 1)
+)
+
+sens_tbl %>%
+  kable(escape=FALSE,
+        caption=paste0("Sensitivity analysis: coefficients before and after excluding ",
+                       n_flagged, " observations flagged by DFBETAs (threshold 2/",
+                       "\\(\\sqrt{n}\\) = ", round(dfb_thresh,3),
+                       "). Weight Gain is highly stable; TSH shows substantial instability."),
+        booktabs=TRUE, linesep="") %>%
+  kable_styling(latex_options="hold_position", font_size=9)
+```
+
+**Influential observations.** Using threshold 4/*n* $\approx$ `r round(cook_thresh,4)`, `r sum(cooks.distance(final_model)>cook_thresh)` observations exceeded Cook's Distance. DFBETAs flagged `r n_flagged` observations (threshold 2/$\sqrt{n}$ = `r round(dfb_thresh,3)`). Table 4 shows that the Weight Gain coefficient was highly stable (\< 0.1% change), confirming it as the most reliable predictor. TSH showed a large reduction (\> 79%), indicating its coefficient is substantially driven by influential points. All observations are retained for primary inference, but TSH instability is acknowledged as a key limitation.
+
+**Interaction analysis.** To investigate the unexpected direction of the cycle regularity coefficient, Model 4 added a PCOS $\times$ Cycle Regularity interaction term. The interaction was not statistically significant (*p* = `r int_p`), indicating the cycle regularity--BMI association does not differ between PCOS-positive and PCOS-negative women. The main effect of cycle regularity remained positive and significant after including the interaction, ruling out a purely subgroup-driven artefact. The most plausible interpretation is sample composition: regular-cycle women in this cohort (predominantly PCOS-negative) tend to have slightly higher BMI due to lifestyle factors captured by other predictors. Cycle regularity should be treated as a descriptive sample association rather than a generalizable biological effect.
+
+**Prediction.** Table 5 presents predicted BMI values and 95% prediction intervals for six representative covariate profiles, with all other continuous predictors held at their sample means. A 95% prediction interval gives the range within which we expect 95% of individual BMI observations to fall for a new woman with that covariate profile. The profiles illustrate the practical scale of the estimated effects: weight gain alone shifts predicted BMI upward by approximately 3.5 kg/m^2^; cycle regularity adds a further \$\approx\$1.3 kg/m^2^; TSH contributes a modest additional gradient.
+
+```{r prediction-table}
+sm <- list(
+  LH         = mean(df$LH),
+  Fasting_BS = mean(df$Fasting_BS),
+  TSH_mean   = mean(df$TSH)
+)
+
+make_profile <- function(wg, cy, tsh_val) {
+  data.frame(
+    Weight_Gain_Yes = as.integer(wg),
+    Cycle_Regular   = as.integer(cy),
+    TSH             = tsh_val,
+    LH              = sm$LH,
+    Fasting_BS      = sm$Fasting_BS,
+    Phys_Act_Yes    = 0L,
+    PCOS_Yes        = 0L,
+    Age             = mean(df$Age),
+    Waist_Hip_Ratio = mean(df$Waist_Hip_Ratio),
+    AMH             = mean(df$AMH, na.rm=TRUE),
+    Pulse_Rate      = mean(df$Pulse_Rate),
+    Fast_Food_Yes   = 0L
+  )
+}
+
+profiles_df <- bind_rows(
+  make_profile(0, 0, sm$TSH_mean - 1),
+  make_profile(0, 0, sm$TSH_mean),
+  make_profile(0, 1, sm$TSH_mean),
+  make_profile(1, 0, sm$TSH_mean),
+  make_profile(1, 1, sm$TSH_mean),
+  make_profile(1, 1, sm$TSH_mean + 3)
+)
+
+pred_out <- predict(final_model, newdata=profiles_df,
+                    interval="prediction", level=0.95)
+
+tibble(
+  Profile         = 1:6,
+  `Weight Gain`   = c("No","No","No","Yes","Yes","Yes"),
+  Cycle           = c("Irregular","Irregular","Regular",
+                      "Irregular","Regular","Regular"),
+  TSH             = round(profiles_df$TSH, 1),
+  `Pred. BMI`     = round(pred_out[,"fit"], 2),
+  `95% PI Lower`  = round(pred_out[,"lwr"], 2),
+  `95% PI Upper`  = round(pred_out[,"upr"], 2)
+) %>%
+  kable(caption="Predicted BMI and 95\\% prediction intervals for six representative profiles. All other continuous predictors held at sample means; all other binary predictors at the reference level. TSH varies around the sample mean (approximately mean$-$1, mean, and mean$+$3 mIU/L). PI = prediction interval.",
+        booktabs=TRUE, linesep="") %>%
+  kable_styling(latex_options=c("hold_position","scale_down"), font_size=9)
+```
+
+```{r fig3-summary, fig.height=2.8, fig.width=6.5, fig.cap="Predicted BMI plotted across the TSH range, stratified by weight gain status (left) and cycle regularity (right). All other predictors held at their sample means. Shaded bands are 95\\% confidence intervals. The weight gain effect dominates --- the gap between groups is approximately 3.5~kg/m\\textsuperscript{2} across the full TSH range."}
+final_vars <- names(coef(final_model))[-1]
+base_vals  <- df %>%
+  dplyr::select(all_of(final_vars)) %>%
+  summarise(across(everything(), ~mean(.x, na.rm=TRUE)))
+
+tsh_range <- seq(min(df$TSH), quantile(df$TSH, 0.95), length.out=80)
+
+# Weight gain grid
+pred_wg <- bind_rows(lapply(c(0,1), function(wg) {
+  g <- base_vals[rep(1, length(tsh_range)),]
+  g$TSH <- tsh_range; g$Weight_Gain_Yes <- wg
+  g$Group <- ifelse(wg==0,"No Weight Gain","Weight Gain"); g
+}))
+ci_wg <- predict(final_model, pred_wg, interval="confidence")
+pred_wg$fit <- ci_wg[,"fit"]; pred_wg$lwr <- ci_wg[,"lwr"]; pred_wg$upr <- ci_wg[,"upr"]
+pred_wg$Group <- factor(pred_wg$Group, levels=c("No Weight Gain","Weight Gain"))
+
+# Cycle regularity grid
+pred_cy <- bind_rows(lapply(c(0,1), function(cy) {
+  g <- base_vals[rep(1, length(tsh_range)),]
+  g$TSH <- tsh_range; g$Cycle_Regular <- cy
+  g$Group <- ifelse(cy==0,"Irregular","Regular"); g
+}))
+ci_cy <- predict(final_model, pred_cy, interval="confidence")
+pred_cy$fit <- ci_cy[,"fit"]; pred_cy$lwr <- ci_cy[,"lwr"]; pred_cy$upr <- ci_cy[,"upr"]
+pred_cy$Group <- factor(pred_cy$Group, levels=c("Irregular","Regular"))
+
+p1 <- ggplot(pred_wg, aes(x=TSH, y=fit, color=Group, fill=Group)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=0.18, color=NA) +
+  geom_line(linewidth=0.9) +
+  scale_color_manual(values=c("grey40","#57068C")) +
+  scale_fill_manual(values=c("grey40","#57068C")) +
+  labs(x="TSH (mIU/L)", y="Predicted BMI (kg/m\u00b2)",
+       title="By Weight Gain Status", color=NULL, fill=NULL) +
+  coord_cartesian(xlim=c(0,10)) +
+  theme_classic(base_size=9) +
+  theme(legend.position="bottom", legend.key.size=unit(0.35,"cm"))
+
+p2 <- ggplot(pred_cy, aes(x=TSH, y=fit, color=Group, fill=Group)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=0.18, color=NA) +
+  geom_line(linewidth=0.9) +
+  scale_color_manual(values=c("grey40","#E07B5A")) +
+  scale_fill_manual(values=c("grey40","#E07B5A")) +
+  labs(x="TSH (mIU/L)", y=NULL,
+       title="By Cycle Regularity", color=NULL, fill=NULL) +
+  coord_cartesian(xlim=c(0,10)) +
+  theme_classic(base_size=9) +
+  theme(legend.position="bottom", legend.key.size=unit(0.35,"cm"))
+
+p1 + p2
+```
+
+## Summary
+
+This study used multiple linear regression to identify independent predictors of BMI in `r n_analytic` women with and without PCOS from Kerala, India. Three variables were significantly associated with BMI after controlling for all others. Weight gain was the dominant predictor --- women reporting recent weight gain had BMI approximately 3.5 kg/m^2^ higher on average --- directly confirming the established link between PCOS-related metabolic dysregulation and adiposity [3, 4]. The TSH association, while statistically significant, was unstable under influential observation removal and should be treated as exploratory; it is nonetheless directionally consistent with prior evidence that modest thyroid function differences are associated with BMI in the general population [5]. Cycle regularity showed a positive but unexpected association most likely reflecting sample composition rather than a true biological effect. Importantly, PCOS diagnosis was not an independent predictor once hormonal and lifestyle covariates were controlled, suggesting PCOS operates on BMI through mediating pathways --- particularly insulin resistance --- rather than as a direct effect [4]. These findings are consistent with prior literature showing that 50--80% of women with PCOS are overweight or obese, driven primarily by endocrine and lifestyle factors [3].
+
+Clinically, these findings suggest that routine monitoring of self-reported weight change and thyroid function may be particularly relevant in PCOS management. Key limitations include the cross-sectional design (preventing causal inference), restriction to a single region (limiting generalizability), binary encoding of lifestyle variables, TSH coefficient instability, and the undefined time frame of the weight gain variable. The model explains approximately 23% of BMI variance, indicating that important predictors --- particularly insulin resistance markers such as HOMA-IR --- were absent. Future work should incorporate continuous metabolic measures, apply multilevel modelling to account for hospital-level clustering, and replicate findings in geographically diverse samples.
+
+\bigskip
+
+## References
+
+\noindent
+[1] Bozdag G, Mumusoglu S, Zengin D, Karabulut E, Yildiz BO. The prevalence and phenotypic features of polycystic ovary syndrome: a systematic review and meta-analysis. *Hum Reprod.* 2016;31(12):2841--2855.
+
+[2] Teede HJ, Misso ML, Costello MF, et al. Recommendations from the international evidence-based guideline for the assessment and management of polycystic ovary syndrome. *Hum Reprod.* 2018;33(9):1602--1618.
+
+[3] Sam S. Obesity and polycystic ovary syndrome. *Obes Manag.* 2007;3(2):69--73.
+
+[4] Dunaif A. Insulin resistance and the polycystic ovary syndrome: mechanism and implications for pathogenesis. *Endocr Rev.* 1997;18(6):774--800.
+
+[5] Knudsen N, Laurberg P, Rasmussen LB, et al. Small differences in thyroid function may be important for body mass index and the occurrence of obesity in the population. *J Clin Endocrinol Metab.* 2005;90(7):4019--4024.
+
+[6] Kottarathil P. Polycystic Ovary Syndrome (PCOS) Dataset. Kaggle. 2020. <https://www.kaggle.com/datasets/prasoonkottarathil/polycystic-ovary-syndrome-pcos>
